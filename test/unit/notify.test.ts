@@ -47,7 +47,18 @@ function createPi(currentSessionId = "session-1", registerOptions: RegisterSubag
 	return { events, sent, notifier, dispose: () => notifier.dispose() };
 }
 
-function createBatchingPi(clock: ReturnType<typeof createFakeClock>, currentSessionId = "session-a") {
+function createBatchingPi(
+	clock: ReturnType<typeof createFakeClock>,
+	currentSessionId = "session-a",
+	batchConfig: RegisterSubagentNotifyOptions["batchConfig"] = {
+		enabled: true,
+		debounceMs: 150,
+		maxWaitMs: 1000,
+		stragglerDebounceMs: 75,
+		stragglerMaxWaitMs: 400,
+		stragglerWindowMs: 2000,
+	},
+) {
 	const events = createEventBus();
 	const sent: Array<{ message: unknown; options: unknown }> = [];
 	const pi = {
@@ -57,7 +68,7 @@ function createBatchingPi(clock: ReturnType<typeof createFakeClock>, currentSess
 		},
 	};
 	const notifier = registerSubagentNotify(pi as never, { currentSessionId, completionOwnerId: COMPLETION_OWNER_ID }, {
-		batchConfig: { enabled: true, debounceMs: 150, maxWaitMs: 1000, stragglerDebounceMs: 75, stragglerMaxWaitMs: 400, stragglerWindowMs: 2000 },
+		batchConfig,
 		timers: clock.api,
 		now: clock.now,
 	});
@@ -430,6 +441,48 @@ describe("registerSubagentNotify", () => {
 			content,
 			display: false,
 		});
+		assert.deepEqual(sent[0]!.options, { triggerTurn: true });
+	});
+
+	it("groups a seven-success async wave into one bounded parent notification", () => {
+		const clock = createFakeClock();
+		const { events, sent } = createBatchingPi(clock, "session-a", {
+			enabled: true,
+			debounceMs: 100,
+			maxWaitMs: 300,
+			stragglerDebounceMs: 50,
+			stragglerMaxWaitMs: 150,
+			stragglerWindowMs: 2000,
+		});
+
+		const emitSuccess = (index: number) => {
+			events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({
+				id: `wave-${index}`,
+				agent: `wave-${index}`,
+				summary: `wave-${index} done`,
+				sessionId: "session-a",
+			}));
+		};
+		emitSuccess(1);
+		clock.advance(90);
+		emitSuccess(2);
+		clock.advance(90);
+		emitSuccess(3);
+		clock.advance(90);
+		for (let index = 4; index <= 7; index++) emitSuccess(index);
+
+		assert.equal(sent.length, 0);
+		clock.advance(29);
+		assert.equal(sent.length, 0);
+		clock.advance(1);
+
+		assert.equal(sent.length, 1);
+		const content = (sent[0]!.message as { content: string }).content;
+		assert.match(content, /^Background tasks completed \(7\):/);
+		for (let index = 1; index <= 7; index++) {
+			assert.match(content, new RegExp(`\\*\\*wave-${index}\\*\\*`));
+			assert.match(content, new RegExp(`wave-${index} done`));
+		}
 		assert.deepEqual(sent[0]!.options, { triggerTurn: true });
 	});
 
