@@ -136,6 +136,34 @@ describe("createCompletionBatcher", () => {
 		batcher.dispose();
 	});
 
+	it("coalesces a seven-success wave into one group at the hard max-wait bound", () => {
+		const clock = createFakeClock();
+		const emitted: string[][] = [];
+		const batcher = createCompletionBatcher<{ label: string }>({
+			config: { enabled: true, debounceMs: 100, maxWaitMs: 300, stragglerDebounceMs: 50, stragglerMaxWaitMs: 150, stragglerWindowMs: 2000 },
+			emit: (items) => emitted.push(items.map((i) => i.label)),
+			timers: clock.api,
+			now: clock.now,
+		});
+
+		batcher.push(item("wave-1"));
+		clock.advance(90);
+		batcher.push(item("wave-2"));
+		clock.advance(90);
+		batcher.push(item("wave-3"));
+		clock.advance(90);
+		for (let index = 4; index <= 7; index++) batcher.push(item(`wave-${index}`));
+
+		// The arrivals keep resetting debounce, but the first arrival's 300ms
+		// max-wait cap still bounds the single grouped emission.
+		assert.deepEqual(emitted, []);
+		clock.advance(29);
+		assert.deepEqual(emitted, []);
+		clock.advance(1);
+		assert.deepEqual(emitted, [["wave-1", "wave-2", "wave-3", "wave-4", "wave-5", "wave-6", "wave-7"]]);
+		batcher.dispose();
+	});
+
 	it("flush emits held items immediately and clears timers", () => {
 		const clock = createFakeClock();
 		const emitted: string[][] = [];
