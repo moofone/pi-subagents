@@ -973,4 +973,31 @@ describe("async resume lookup", () => {
 		assert.match(task, /Original session file: \/tmp\/session\.jsonl/);
 		assert.match(task, /Follow-up:\nWhat changed\?/);
 	});
+
+	it("preserves handoff continuation lineage when resolving a retained run", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-continuation-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(resultsDir, "run-continuation.json"), {
+				runId: "run-continuation",
+				mode: "single",
+				state: "complete",
+				success: true,
+				agent: "worker",
+				sessionFile,
+				continuation: { runIds: ["run-source", "run-continuation"] },
+				handoffContinuation: { eventId: "handoff-1", sourceRunId: "run-source", runId: "run-continuation" },
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "run-continuation" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.deepEqual((target as unknown as Record<string, unknown>).continuation, { runIds: ["run-source", "run-continuation"] });
+			assert.deepEqual((target as unknown as Record<string, unknown>).handoffContinuation, { eventId: "handoff-1", sourceRunId: "run-source", runId: "run-continuation" });
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 });

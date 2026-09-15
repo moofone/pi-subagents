@@ -78,6 +78,8 @@ import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-
 import { resolvePermissionRules, type PermissionConfig } from "../shared/permissions.ts";
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
+import { executeWorkflowHostCommand, resolveWorkflowHostOutputClaimPath, type WorkflowHostCommandExecutionInput, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "../../workflows/host-command.ts";
+import { workflowDeadlineElapsed } from "../../workflows/workflow-preflight.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -284,6 +286,63 @@ interface AsyncExecutionResult {
 	content: Array<{ type: "text"; text: string }>;
 	details: Details;
 	isError?: boolean;
+}
+
+export function asyncDeadlineElapsed(absoluteDeadlineAt: number | undefined): boolean {
+	return workflowDeadlineElapsed(absoluteDeadlineAt);
+}
+
+/**
+ * Execute one host command from an async workflow without routing it through a
+ * child-agent runner. The absolute deadline check is deliberately performed at
+ * this boundary as well as in executeWorkflowHostCommand: callers that provide
+ * a custom executor cannot accidentally launch an already-expired step.
+ */
+export async function executeAsyncHostStep(input: WorkflowHostCommandExecutionInput): Promise<WorkflowHostCommandResult> {
+	if (asyncDeadlineElapsed(input.absoluteDeadlineAt)) {
+		throw new Error(`The absolute deadline expired before host command '${input.key}' could launch.`);
+	}
+	return executeWorkflowHostCommand(input);
+}
+
+/**
+ * Build the callback used by a detached workflow's runs.host entry point. It
+ * owns output claims for the duration of the workflow and records successful
+ * evidence paths, while executeAsyncHostStep remains the single command entry.
+ */
+export function createAsyncHostStepRunner(input: {
+	workflowCwd: string;
+	artifactsDir: string;
+	workflowRunId: string;
+	claimedOutputPaths: Map<string, string>;
+	producedOutputPaths: Set<string>;
+	absoluteDeadlineAt?: number;
+}): (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult> {
+	return async (key, params, signal) => {
+		const safeKey = key.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128) || "host-step";
+		const defaultOutputPath = path.join(input.artifactsDir, "outputs", input.workflowRunId, "host", `${safeKey}.log`);
+		const outputPath = params.output ? path.resolve(input.workflowCwd, params.output) : defaultOutputPath;
+		// Do not leave a stale reservation behind when a retry reaches this
+		// callback after its enclosing single-run deadline has elapsed.
+		if (asyncDeadlineElapsed(input.absoluteDeadlineAt)) {
+			throw new Error(`The absolute deadline expired before host command '${key}' could launch.`);
+		}
+		const claimPath = resolveWorkflowHostOutputClaimPath(outputPath);
+		const previous = input.claimedOutputPaths.get(claimPath);
+		if (previous) throw new Error(`runs.host('${key}') output path is already claimed by '${previous}': ${outputPath}.`);
+		input.claimedOutputPaths.set(claimPath, `host:${key}`);
+		const result = await executeAsyncHostStep({
+			key,
+			params,
+			cwd: input.workflowCwd,
+			defaultOutputPath,
+			claimedOutputPath: claimPath,
+			signal,
+			...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
+		});
+		input.producedOutputPaths.add(resolveWorkflowHostOutputClaimPath(result.outputPath));
+		return result;
+	};
 }
 
 export interface AsyncRunnerStepBuildParams {
@@ -1619,7 +1678,13 @@ export function executeAsyncSingle(
 	const timeoutMs = params.absoluteDeadlineAt !== undefined && deadlineAt !== undefined
 		? deadlineAt - Date.now()
 		: params.timeoutMs;
-	if (timeoutMs !== undefined && timeoutMs <= 0) return formatAsyncStartError("single", "The source run's absolute deadline expired before recovery could launch.");
+	// Retry/recovery launches inherit the source run's absolute deadline. Treat
+	// non-finite timestamps and elapsed budgets as exhausted instead of passing
+	// Infinity/NaN to the detached runner, where they would disable the gate or
+	// turn into an immediate, unbounded retry.
+	if (deadlineAt !== undefined && (!Number.isFinite(deadlineAt) || timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0)) {
+		return formatAsyncStartError("single", "The source run's absolute deadline expired before recovery could launch.");
+	}
 	const resolvedToolTimeout = resolveToolTimeoutMs({
 		callValue: params.toolTimeoutMs,
 		agentValue: agentConfig.defaultToolTimeoutMs,

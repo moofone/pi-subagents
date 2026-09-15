@@ -255,4 +255,25 @@ describe("createCompletionBatcher", () => {
 		assert.deepEqual(emitted, [["a"], ["b"]]);
 		batcher.dispose();
 	});
+
+	it("flushes a held group before emitting a continuation boundary", () => {
+		const clock = createFakeClock();
+		const emitted: string[][] = [];
+		const batcher = createCompletionBatcher<{ label: string }>({
+			config: { ...DEFAULT_COMPLETION_BATCH_CONFIG, enabled: true, debounceMs: 150, maxWaitMs: 1000 },
+			emit: (items) => emitted.push(items.map((i) => i.label)),
+			timers: clock.api,
+			now: clock.now,
+		});
+
+		batcher.push(item("ordinary"));
+		batcher.pushContinuation(item("handoff"));
+
+		assert.deepEqual(emitted, [["ordinary"], ["handoff"]]);
+		assert.equal(clock.pendingCount(), 0);
+		clock.advance(1000);
+		assert.deepEqual(emitted, [["ordinary"], ["handoff"]]);
+		batcher.dispose();
+	});
+
 });

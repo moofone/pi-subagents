@@ -1032,6 +1032,8 @@ export interface RunWorkflowScriptOptions {
 	/** Maximum children executing concurrently within this workflow. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
+	/** Last-mile admission gate checked after queueing and immediately before dispatch. */
+	beforeLaunch?: (key: string, params: Record<string, unknown>) => void | string | Promise<void | string>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
 	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
@@ -1939,10 +1941,14 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 						return stoppedChildResult(key, text);
 					}
+					const gate = await options.beforeLaunch?.(key, launchParams);
+					if (typeof gate === "string" && gate) throw new Error(gate);
 					const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
 					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
 					if (!autoResumeParams) return result;
 					resolvedResumeLineage = [...new Set([...(resolvedResumeLineage ?? []), result.runId!])];
+					const retryGate = await options.beforeLaunch?.(key, autoResumeParams);
+					if (typeof retryGate === "string" && retryGate) throw new Error(retryGate);
 					trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), ...(generatedLaneKey ? { generatedLaneKey } : {}), phase: "auto-resume", runId: result.runId });
 					traceChanged();
 					return options.launch(key, autoResumeParams, childSignal, { admitted: true, batch: batch !== undefined });

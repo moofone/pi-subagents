@@ -84,9 +84,16 @@ export interface CompletionBatcherOptions<T> {
 	now?: () => number;
 }
 
+export interface CompletionBatchPushOptions {
+	/** Continuation events are ordering boundaries, never part of a success batch. */
+	kind?: "completion" | "continuation";
+}
+
 export interface CompletionBatcher<T> {
 	/** Add a batchable item. Emits immediately when batching is disabled. */
-	push(item: T): void;
+	push(item: T, options?: CompletionBatchPushOptions): void;
+	/** Emit a continuation event after flushing any ordinary completion group. */
+	pushContinuation(item: T): void;
 	/** Emit any held items immediately as a single group. */
 	flush(): void;
 	/** Clear timers and return items that were never emitted. */
@@ -106,6 +113,9 @@ export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>)
 	if (!config.enabled) {
 		return {
 			push(item: T) {
+				options.emit([item]);
+			},
+			pushContinuation(item: T) {
 				options.emit([item]);
 			},
 			flush() {},
@@ -139,8 +149,18 @@ export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>)
 		options.emit(items);
 	};
 
+	const emitContinuation = (item: T) => {
+		emitGroup();
+		options.emit([item]);
+		lastEmitAt = now();
+	};
+
 	return {
-		push(item: T) {
+		push(item: T, pushOptions?: CompletionBatchPushOptions) {
+			if (pushOptions?.kind === "continuation") {
+				emitContinuation(item);
+				return;
+			}
 			if (pending.length === 0) {
 				straggler = lastEmitAt !== null && (now() - lastEmitAt) < config.stragglerWindowMs;
 			}
@@ -157,6 +177,7 @@ export function createCompletionBatcher<T>(options: CompletionBatcherOptions<T>)
 				unrefHandle(maxWaitTimer);
 			}
 		},
+		pushContinuation: emitContinuation,
 		flush: emitGroup,
 		dispose() {
 			clearTimers();

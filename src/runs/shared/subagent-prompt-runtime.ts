@@ -352,7 +352,16 @@ export function stripParentOnlySubagentMessages(messages: unknown[], options: { 
 	return changed ? filtered : messages;
 }
 
-export function formatSteerMessage(request: SteerRequest): string {
+export function formatSteerMessage(request: SteerRequest, options: { compact?: boolean } = {}): string {
+	if (options.compact) {
+		return [
+			"Compaction checkpoint from the parent orchestrator:",
+			"",
+			request.message,
+			"",
+			"Apply at the next safe point; do not restart unless asked.",
+		].join("\n");
+	}
 	return [
 		request.mode === "follow_up" ? "Queued follow-up from the parent orchestrator:" : "Mid-run steering from the parent orchestrator:",
 		"",
@@ -454,6 +463,7 @@ export function registerSteeringInbox(
 	const sendUserMessage = (pi as { sendUserMessage?: (content: string, options?: { deliverAs: "steer" | "followUp" }) => unknown }).sendUserMessage;
 	const childIndex = Number(process.env[SUBAGENT_CHILD_INDEX_ENV]);
 	const pending = new Map<string, Array<{ request: SteerRequest; deliveryStatus: SteerDeliveryStatus }>>();
+	const compactCheckpointIds = new Set<string>();
 	const queued: Array<{ request: SteerRequest; ready: boolean }> = [];
 	let disposed = false;
 	let agentRunning = false;
@@ -489,6 +499,7 @@ export function registerSteeringInbox(
 			const requests = consumeSteerRequestsFromDir(steerInbox);
 			for (let index = 0; index < requests.length; index++) {
 				const request = requests[index]!;
+				const compactCheckpoint = compactCheckpointIds.delete(request.id);
 				if (!canSteer || typeof sendUserMessage !== "function") {
 					acknowledge(request, "failed", "Child Pi session does not support sendUserMessage steering.");
 					continue;
@@ -501,7 +512,7 @@ export function registerSteeringInbox(
 					acknowledge(request, "failed", `Follow-up queue is full (${MAX_STEER_QUEUE_SIZE} messages).`);
 					continue;
 				}
-				const formatted = formatSteerMessage(request);
+				const formatted = formatSteerMessage(request, { compact: compactCheckpoint });
 				const entries = pending.get(formatted) ?? [];
 				entries.push({ request, deliveryStatus: delivery === "followUp" ? "queued" : "delivered" });
 				pending.set(formatted, entries);
@@ -627,9 +638,11 @@ export function registerSteeringInbox(
 		const unresolved = [...pending.values()].flat();
 		pending.clear();
 		for (const entry of unresolved) {
+			compactCheckpointIds.add(entry.request.id);
 			try {
 				writeSteerRequestToDir(steerInbox, { ...entry.request, mode: "follow_up" });
 			} catch (error) {
+				compactCheckpointIds.delete(entry.request.id);
 				acknowledge(entry.request, "failed", `Could not retry steering after compaction: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}

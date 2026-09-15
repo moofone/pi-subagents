@@ -33,6 +33,17 @@ export interface WorkflowHostCommandResult {
 	error?: string;
 }
 
+export interface WorkflowHostCommandExecutionInput {
+	key: string;
+	params: WorkflowHostCommandParams;
+	cwd: string;
+	defaultOutputPath: string;
+	claimedOutputPath?: string;
+	signal: AbortSignal;
+	/** Absolute wall-clock deadline inherited from the enclosing async run. */
+	absoluteDeadlineAt?: number;
+}
+
 type ProcessTreeTerminal = Awaited<ReturnType<OwnedProcessTreeController["terminate"]>>;
 type ProcessTreeCleanup = ProcessTreeTerminal | { state: "unknown"; reason: "missing-process-id" };
 
@@ -117,17 +128,19 @@ function terminateProcessTree(pid: number, controller: OwnedProcessTreeControlle
 	});
 }
 
-export async function executeWorkflowHostCommand(input: {
-	key: string;
-	params: WorkflowHostCommandParams;
-	cwd: string;
-	defaultOutputPath: string;
-	claimedOutputPath?: string;
-	signal: AbortSignal;
-}): Promise<WorkflowHostCommandResult> {
+export async function executeWorkflowHostCommand(input: WorkflowHostCommandExecutionInput): Promise<WorkflowHostCommandResult> {
 	const outputPath = input.params.output ? path.resolve(input.cwd, input.params.output) : input.defaultOutputPath;
 	const relative = path.relative(input.cwd, outputPath);
 	if (input.params.output && (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) throw new Error(`runs.host('${input.key}') output escapes the workflow cwd.`);
+	// The enclosing async deadline is absolute. Check it before any output
+	// directory side effects and again immediately before spawn, so admission or
+	// output validation cannot grant the command a fresh timeout window.
+	const remainingDeadlineMs = input.absoluteDeadlineAt === undefined
+		? undefined
+		: input.absoluteDeadlineAt - Date.now();
+	if (remainingDeadlineMs !== undefined && (!Number.isFinite(remainingDeadlineMs) || remainingDeadlineMs <= 0)) {
+		throw new Error(`The absolute deadline expired before host command '${input.key}' could launch.`);
+	}
 	if (input.params.output) assertSafeExplicitOutput(input.cwd, outputPath, input.key);
 	else fs.mkdirSync(path.dirname(outputPath), { recursive: true });
 	const startedAt = Date.now();
@@ -139,6 +152,14 @@ export async function executeWorkflowHostCommand(input: {
 	let settled = false;
 
 	return new Promise((resolve, reject) => {
+		const spawnRemainingMs = input.absoluteDeadlineAt === undefined
+			? input.params.timeoutMs
+			: input.absoluteDeadlineAt - Date.now();
+		if (!Number.isFinite(spawnRemainingMs) || spawnRemainingMs <= 0) {
+			reject(new Error(`The absolute deadline expired before host command '${input.key}' could launch.`));
+			return;
+		}
+		const commandTimeoutMs = Math.min(input.params.timeoutMs, spawnRemainingMs);
 		const child = spawn(quoteExecutableForShell(input.params.command), {
 			cwd: input.cwd,
 			env: process.env,
@@ -159,7 +180,7 @@ export async function executeWorkflowHostCommand(input: {
 				termination ??= Promise.resolve({ state: "unknown", reason: "missing-process-id" });
 			}
 		};
-		const timeout = setTimeout(() => terminate("timeout"), input.params.timeoutMs);
+		const timeout = setTimeout(() => terminate("timeout"), commandTimeoutMs);
 		timeout.unref?.();
 		const onAbort = () => terminate("abort");
 		if (input.signal.aborted) onAbort();
@@ -180,7 +201,7 @@ export async function executeWorkflowHostCommand(input: {
 			const terminal = termination ? await termination : await processTree?.finishAfterWriterClose();
 			const cleanupError = process.platform !== "win32" && terminal?.state === "unknown" ? terminal.reason : undefined;
 			const state = timedOut ? "timed-out" : stopped ? "stopped" : exitCode === 0 && !spawnError && !cleanupError ? "passed" : "failed";
-			const error = spawnError instanceof Error ? spawnError.message : spawnError ? String(spawnError) : cleanupError ? `Process-tree cleanup failed: ${cleanupError}.` : state === "timed-out" ? `Command timed out after ${input.params.timeoutMs}ms.` : state === "stopped" ? "Command stopped because the workflow was aborted." : state === "failed" ? `Command exited with code ${exitCode ?? "unknown"}.` : undefined;
+			const error = spawnError instanceof Error ? spawnError.message : spawnError ? String(spawnError) : cleanupError ? `Process-tree cleanup failed: ${cleanupError}.` : state === "timed-out" ? `Command timed out after ${commandTimeoutMs}ms.` : state === "stopped" ? "Command stopped because the workflow was aborted." : state === "failed" ? `Command exited with code ${exitCode ?? "unknown"}.` : undefined;
 			try {
 				if (input.params.output) assertSafeExplicitOutput(input.cwd, outputPath, input.key);
 				if (input.claimedOutputPath && resolveWorkflowHostOutputClaimPath(outputPath) !== input.claimedOutputPath) throw new Error(`output path changed after it was claimed.`);

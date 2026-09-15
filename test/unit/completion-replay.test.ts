@@ -302,4 +302,31 @@ describe("completion replay", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it("replays handoff continuation metadata after the result file is consumed", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-completion-replay-continuation-"));
+		try {
+			const record = writeCompletionReplay({
+				resultsDir,
+				runId: "run-continuation",
+				sessionId: "session-a",
+				completion: { runId: "run-continuation" },
+				data: {
+					runId: "run-continuation",
+					continuation: { runIds: ["run-source", "run-continuation"] },
+					handoffContinuation: { eventId: "handoff-1", sourceRunId: "run-source", runId: "run-continuation" },
+				},
+				now: 10_000,
+				ttlMs: 60_000,
+			});
+			const replay = readCompletionReplay(resultsDir, "run-continuation", { sessionId: "session-a", now: 10_001 });
+			const completion = replay?.completion as unknown as Record<string, unknown>;
+			assert.deepEqual(completion.continuation, { runIds: ["run-source", "run-continuation"] });
+			assert.deepEqual(completion.handoffContinuation, { eventId: "handoff-1", sourceRunId: "run-source", runId: "run-continuation" });
+			assert.equal(record.completion.runId, "run-continuation");
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 });

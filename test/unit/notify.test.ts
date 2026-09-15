@@ -547,6 +547,25 @@ describe("registerSubagentNotify", () => {
 		assert.equal(newRegistration.sent.length, 1);
 		newRegistration.dispose();
 	});
+
+	it("delivers handoff continuation events outside the ordinary completion batch", () => {
+		const clock = createFakeClock();
+		const { events, sent } = createBatchingPi(clock);
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "ordinary-before-handoff", summary: "ordinary" }));
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({
+			id: "continued-run",
+			summary: "continued",
+			continuationEvent: { eventId: "handoff-boundary", sourceRunId: "source-run", runId: "continued-run" },
+		}));
+
+		assert.equal(sent.length, 2);
+		assert.match((sent[0]!.message as { content: string }).content, /ordinary/);
+		assert.match((sent[1]!.message as { content: string }).content, /Handoff continuation: handoff-boundary/);
+		assert.equal((sent[1]!.message as { display: boolean }).display, true);
+		clock.advance(1000);
+		assert.equal(sent.length, 2);
+	});
+
 });
 
 describe("completion formatting helpers", () => {
@@ -762,6 +781,23 @@ describe("completion formatting helpers", () => {
 		assert.equal(details.agent, "unknown");
 		assert.equal(details.status, "completed");
 	});
+
+	it("renders a handoff continuation event as visible metadata", () => {
+		const details = buildCompletionDetails({
+			id: "run-continuation",
+			runId: "run-continuation",
+			agent: "worker",
+			success: true,
+			summary: "Continued work finished.",
+			handoffContinuation: { eventId: "handoff-1", sourceRunId: "run-source", runId: "run-continuation" },
+		});
+		const content = formatSingleCompletion(details);
+		assert.match(content, /Handoff continuation: handoff-1/);
+		assert.match(content, /source run-source/);
+		assert.match(content, /continued run-continuation/);
+		assert.equal(details.status, "completed");
+	});
+
 });
 
 describe("scheduled completions", () => {

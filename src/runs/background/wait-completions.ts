@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import type { ArtifactPaths, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
+import type { ArtifactPaths, ContinuationLineage, HandoffContinuationEvent, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
 import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
@@ -11,6 +11,26 @@ function asNonEmptyString(value: unknown): string | undefined {
 
 function nonNegativeNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function continuationLineage(value: unknown): ContinuationLineage | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const runIds = (value as Record<string, unknown>).runIds;
+	if (!Array.isArray(runIds)) return undefined;
+	const normalized = [...new Set(runIds.filter((runId): runId is string => typeof runId === "string" && Boolean(runId.trim())).map((runId) => runId.trim()))];
+	return normalized.length ? { runIds: normalized } : undefined;
+}
+
+function handoffContinuation(value: unknown): HandoffContinuationEvent | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const source = value as Record<string, unknown>;
+	const eventId = asNonEmptyString(source.eventId) ?? asNonEmptyString(source.id);
+	const sourceRunId = asNonEmptyString(source.sourceRunId);
+	const runId = asNonEmptyString(source.runId);
+	const kind = source.kind === "handoff" || source.kind === "resume" || source.kind === "continuation" ? source.kind : undefined;
+	const sequence = typeof source.sequence === "number" && Number.isSafeInteger(source.sequence) && source.sequence >= 0 ? source.sequence : undefined;
+	if (!eventId && !sourceRunId && !runId && !kind && sequence === undefined) return undefined;
+	return { ...(eventId ? { eventId } : {}), ...(sourceRunId ? { sourceRunId } : {}), ...(runId ? { runId } : {}), ...(sequence !== undefined ? { sequence } : {}), ...(kind ? { kind } : {}) };
 }
 
 function projectedUsage(value: unknown): Usage | undefined {
@@ -65,6 +85,8 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 			const error = asNonEmptyString(child.error);
 			const model = asNonEmptyString(child.model);
 			const contextOverflow = child.contextOverflow === true;
+			const childContinuation = continuationLineage(child.continuation);
+			const childContinuationEvent = handoffContinuation(child.handoffContinuation ?? child.continuationEvent);
 			return [{
 				...(agent ? { agent } : {}),
 				...(childRunId ? { runId: childRunId } : {}),
@@ -76,6 +98,8 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 				...(model ? { model } : {}),
 				...(contextOverflow ? { contextOverflow: true } : {}),
 				...(artifactPaths ? { artifactPaths } : {}),
+				...(childContinuation ? { continuation: childContinuation } : {}),
+				...(childContinuationEvent ? { handoffContinuation: childContinuationEvent, continuationEvent: childContinuationEvent } : {}),
 			}];
 		})
 		: undefined;
@@ -84,12 +108,16 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 	const state = asNonEmptyString(data.state);
 	const workflowChildren = parseWorkflowChildSummary(data.workflowChildren);
 	if (workflowChildren && workflowChildren.workflowRunId !== runId) throw new Error("workflowChildren.workflowRunId does not match its completion run id.");
+	const continuation = continuationLineage(data.continuation);
+	const continuationEvent = handoffContinuation(data.handoffContinuation ?? data.continuationEvent);
 	return {
 		runId,
 		...(agent ? { agent } : {}),
 		...(mode ? { mode } : {}),
 		...(state ? { state } : {}),
 		...(typeof data.success === "boolean" ? { success: data.success } : {}),
+		...(continuation ? { continuation } : {}),
+		...(continuationEvent ? { handoffContinuation: continuationEvent, continuationEvent } : {}),
 		...(results && results.length > 0 ? { results } : {}),
 		...(workflowChildren ? { workflowChildren } : {}),
 	};

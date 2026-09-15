@@ -1,19 +1,36 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
-import type { ExternalCliReceiptMetadata, WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState, WorkflowRecoveryAction, WorkflowTerminalOutcome, WorkflowTerminalResolution } from "../shared/types.ts";
+import type { ExternalCliReceiptMetadata, WorkflowReceipt as SharedWorkflowReceipt, WorkflowReceiptEntry as SharedWorkflowReceiptEntry, WorkflowReceiptState, WorkflowRecoveryAction, WorkflowTerminalOutcome, WorkflowTerminalResolution } from "../shared/types.ts";
 import type { WorkflowReceiptResumeReference, WorkflowScriptChildResult } from "./scripted-workflow.ts";
 import { parseWorkflowChildSummary } from "./workflow-child-summary.ts";
 import { HOST_STEP_MAX_COUNT, assertUniqueHostStepIds, parseHostStepNode } from "../runs/shared/host-step-status.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../runs/shared/lane-metadata.ts";
 
-export type { WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState } from "../shared/types.ts";
+export interface WorkflowReceiptArtifactIdentity {
+	path: string;
+	bytes: number;
+	digest: string;
+}
+
+export type WorkflowReceiptEntry = SharedWorkflowReceiptEntry & {
+	artifactIdentity?: WorkflowReceiptArtifactIdentity;
+};
+
+export type WorkflowReceipt = Omit<SharedWorkflowReceipt, "entries"> & {
+	entries: Record<string, WorkflowReceiptEntry>;
+};
+
+export type { WorkflowReceiptState } from "../shared/types.ts";
 
 export const WORKFLOW_RECEIPT_VERSION = 1;
 export const WORKFLOW_RECEIPT_FILE = "workflow-receipt.json";
 const MAX_WORKFLOW_RECEIPT_BYTES = 2 * 1024 * 1024;
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ARTIFACT_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_ARTIFACT_IDENTITY_PATH_BYTES = 4096;
 
 function assertSafeRunId(value: string, label: string): string {
 	const normalized = value.trim();
@@ -26,6 +43,37 @@ function assertSafeRunId(value: string, label: string): string {
 function assertKey(value: string, label: string): string {
 	if (!KEY_PATTERN.test(value)) throw new Error(`${label} is invalid.`);
 	return value;
+}
+
+function artifactIdentity(filePath: string): WorkflowReceiptArtifactIdentity | undefined {
+	const normalizedPath = filePath.trim();
+	if (!normalizedPath || Buffer.byteLength(normalizedPath, "utf-8") > MAX_ARTIFACT_IDENTITY_PATH_BYTES) return undefined;
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(normalizedPath, "r");
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile()) return undefined;
+		const hash = createHash("sha256");
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		let bytes = 0;
+		for (;;) {
+			const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+			if (bytesRead <= 0) break;
+			bytes += bytesRead;
+			hash.update(buffer.subarray(0, bytesRead));
+		}
+		return { path: normalizedPath, bytes, digest: hash.digest("hex") };
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Artifact identity is best-effort; a close failure must not block receipt creation.
+			}
+		}
+	}
 }
 
 export function workflowReceiptPath(asyncDirRoot: string, workflowRunId: string): string {
@@ -53,6 +101,8 @@ export function buildWorkflowReceipt(input: {
 		const latestRunId = runIds.at(-1);
 		const resumability = child.resumability ?? { state: "not-resumable", reason: child.runId ? "resumability was not recorded" : "child produced no run id" };
 		if (resumability.state === "resumable" && !latestRunId) throw new Error(`Workflow receipt child '${key}' is resumable but has no retained run id.`);
+		const outputReference = child.outputReference?.trim();
+		const outputArtifactIdentity = outputReference ? artifactIdentity(outputReference) : undefined;
 		const base = {
 			key,
 			...(lane ? { lane } : {}),
@@ -60,7 +110,8 @@ export function buildWorkflowReceipt(input: {
 			...(child.agent ? { agent: child.agent } : {}),
 			...(child.requestedContext ? { requestedContext: child.requestedContext } : {}),
 			...(child.resolvedContext ? { resolvedContext: child.resolvedContext } : {}),
-			...(child.outputReference ? { outputReference: child.outputReference } : {}),
+			...(outputReference ? { outputReference } : {}),
+			...(outputArtifactIdentity ? { artifactIdentity: outputArtifactIdentity } : {}),
 			...(child.externalAdapter ? { externalAdapter: child.externalAdapter } : {}),
 			continuation: { runIds },
 		};
@@ -202,6 +253,19 @@ function parseExternalCliReceiptMetadata(value: unknown, key: string, source: st
 	return value as ExternalCliReceiptMetadata;
 }
 
+function parseArtifactIdentity(value: unknown, key: string, source: string): WorkflowReceiptArtifactIdentity | undefined {
+	if (value === undefined) return undefined;
+	const label = `Invalid workflow receipt '${source}': entry '${key}' artifactIdentity`;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
+	const identity = value as Record<string, unknown>;
+	const unknownFields = Object.keys(identity).filter((field) => !["path", "bytes", "digest"].includes(field));
+	if (unknownFields.length > 0) throw new Error(`${label} has unsupported fields: ${unknownFields.join(", ")}.`);
+	if (typeof identity.path !== "string" || !identity.path.trim() || Buffer.byteLength(identity.path.trim(), "utf-8") > MAX_ARTIFACT_IDENTITY_PATH_BYTES) throw new Error(`${label}.path is invalid.`);
+	if (typeof identity.bytes !== "number" || !Number.isSafeInteger(identity.bytes) || identity.bytes < 0) throw new Error(`${label}.bytes is invalid.`);
+	if (typeof identity.digest !== "string" || !ARTIFACT_DIGEST_PATTERN.test(identity.digest)) throw new Error(`${label}.digest is invalid.`);
+	return { path: identity.path.trim(), bytes: identity.bytes, digest: identity.digest };
+}
+
 function parseTerminalOutcome(value: unknown, label: string): WorkflowTerminalOutcome | undefined {
 	if (value === undefined) return undefined;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
@@ -214,6 +278,9 @@ function parseEntry(value: unknown, key: string, source: string): WorkflowReceip
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid workflow receipt '${source}': entry '${key}' must be an object.`);
 	const entry = value as Record<string, unknown>;
 	if (entry.key !== key) throw new Error(`Invalid workflow receipt '${source}': entry '${key}' has a mismatched key.`);
+	const outputReference = entry.outputReference;
+	const parsedArtifactIdentity = parseArtifactIdentity(entry.artifactIdentity, key, source);
+	if (parsedArtifactIdentity && (typeof outputReference !== "string" || outputReference.trim() !== parsedArtifactIdentity.path)) throw new Error(`Workflow receipt '${source}' entry '${key}' artifactIdentity is stale: path does not match outputReference.`);
 	const latestRunId = entry.latestRunId;
 	if (latestRunId !== undefined && (typeof latestRunId !== "string" || !latestRunId.trim())) throw new Error(`Invalid workflow receipt '${source}': entry '${key}' latestRunId must be non-empty.`);
 	const continuation = entry.continuation;
@@ -234,7 +301,7 @@ function parseEntry(value: unknown, key: string, source: string): WorkflowReceip
 	parseExternalCliReceiptMetadata(entry.externalAdapter, key, source);
 	const lane = normalizeWorkflowLaneMetadata(entry.lane, `Invalid workflow receipt '${source}': entry '${key}'.lane`);
 	assertWorkflowLaneKey(lane, key, `Invalid workflow receipt '${source}': entry '${key}'.lane`);
-	return { ...(value as WorkflowReceiptEntry), ...(lane ? { lane } : {}), ...(terminalOutcome ? { terminalOutcome } : {}) };
+	return { ...(value as WorkflowReceiptEntry), ...(parsedArtifactIdentity ? { artifactIdentity: parsedArtifactIdentity } : {}), ...(lane ? { lane } : {}), ...(terminalOutcome ? { terminalOutcome } : {}) };
 }
 
 function parseWorkflowResolution(value: unknown, source: string): WorkflowTerminalResolution | undefined {

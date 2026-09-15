@@ -43,7 +43,7 @@ import {
 	type SequentialStep,
 } from "../../shared/settings.ts";
 import { normalizeSkillInput } from "../../agents/skills.ts";
-import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath } from "../background/async-execution.ts";
+import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath, asyncDeadlineElapsed } from "../background/async-execution.ts";
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { steeringReceipt } from "../background/steering.ts";
 import { acquireActiveAsyncCapacity, ActiveAsyncCapacityError, getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession, transferActiveAsyncCapacity, type ActiveAsyncCapacityHandle } from "../background/active-async-capacity.ts";
@@ -4227,6 +4227,11 @@ function workflowFailureTerminalOutcome(error: unknown, _children: WorkflowScrip
 	if (usageBudget?.exhausted) return { state: "partial", reason: "budget_exhausted" };
 	return error instanceof WorkflowScriptError && error.errorKind === "timeout" ? { state: "partial", reason: "timeout" } : undefined;
 }
+function workflowChildDeadlineGate(deadlineAt: number | undefined, key: string): string | undefined {
+	return asyncDeadlineElapsed(deadlineAt)
+		? `Workflow deadline expired before child '${key}' could launch.`
+		: undefined;
+}
 
 function workflowFailureMessage(error: unknown, workflowRunId: string, children: WorkflowScriptChildResult[]): string {
 	const text = error instanceof Error ? error.message : String(error);
@@ -5008,6 +5013,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								persist({ tolerateStatusWriteFailure: true });
 								appendWorkflowEvent({ type: "subagent.workflow.emit", value: emits.at(-1) });
 							},
+							beforeLaunch: (key) => workflowChildDeadlineGate(workflowDeadlineAt, key),
 							launch: async (key, childParams, workflowSignal, admission) => {
 								if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."), childParams, deps.state);
 								const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
@@ -5232,6 +5238,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						liveWorkflow = { ...liveWorkflow, emits };
 						sendWorkflowProgress();
 					},
+					beforeLaunch: (key) => workflowChildDeadlineGate(workflowDeadlineAt, key),
 					launch: async (key, childParams, workflowSignal, admission) => {
 						if (delegatedWorkflowPermit && admission.batch) throw new Error("Workflow child permit does not support runs.all.");
 						if (delegatedWorkflowPermit && childParams.resume !== undefined) throw new Error("Workflow child permit does not support retained resume.");

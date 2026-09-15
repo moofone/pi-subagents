@@ -132,6 +132,14 @@ export function validateWorkflowPreflight(input: unknown): WorkflowPreflightVali
 	}
 }
 
+/**
+ * Resolve an absolute workflow deadline without granting invalid timestamps a
+ * fresh execution window. This is shared by host and child dispatch gates.
+ */
+export function workflowDeadlineElapsed(absoluteDeadlineAt: number | undefined, now = Date.now()): boolean {
+	return absoluteDeadlineAt !== undefined && (!Number.isFinite(absoluteDeadlineAt) || absoluteDeadlineAt <= now);
+}
+
 function warningLimit(messages: string[]): string[] {
 	if (messages.length <= WORKFLOW_PREFLIGHT_MAX_WARNINGS) return messages;
 	const omitted = messages.length - WORKFLOW_PREFLIGHT_MAX_WARNINGS + 1;
