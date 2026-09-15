@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -120,6 +121,46 @@ describe("workflow receipts", () => {
 		}));
 
 		assert.equal(readWorkflowReceipt(asyncRoot, "workflow-old-grok").entries.grok?.externalAdapter?.adapter.id, "grok-build");
+	});
+
+	it("records the identity of an existing output artifact without embedding its content", () => {
+		const root = tempRoot();
+		const outputPath = path.join(root, "review.md");
+		const output = "review artifact\n";
+		fs.writeFileSync(outputPath, output, "utf-8");
+		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-artifact", state: "complete", children: [child("advisor", { outputReference: outputPath, artifactPaths: [outputPath] })], createdAt: 10 });
+
+		assert.deepEqual(receipt.entries.advisor?.artifactIdentity, {
+			path: outputPath,
+			bytes: Buffer.byteLength(output, "utf-8"),
+			digest: createHash("sha256").update(output, "utf-8").digest("hex"),
+		});
+		assert.doesNotMatch(JSON.stringify(receipt), /review artifact/);
+
+		const asyncDir = path.join(root, "workflow-artifact");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, receipt);
+		assert.deepEqual(readWorkflowReceipt(root, "workflow-artifact").entries.advisor?.artifactIdentity, receipt.entries.advisor?.artifactIdentity);
+	});
+
+	it("fails closed for malformed or stale artifact identities", () => {
+		const root = tempRoot();
+		const outputPath = path.join(root, "review.md");
+		fs.writeFileSync(outputPath, "review artifact\n", "utf-8");
+		const asyncDir = path.join(root, "workflow-artifact-invalid");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-artifact-invalid", state: "complete", children: [child("advisor", { outputReference: outputPath })], createdAt: 10 });
+		const receiptPath = workflowReceiptPath(root, "workflow-artifact-invalid");
+		writeWorkflowReceipt(asyncDir, receipt);
+		const malformed = JSON.parse(fs.readFileSync(receiptPath, "utf-8")) as { entries: { advisor: { artifactIdentity: { digest: string; path: string } } } };
+		malformed.entries.advisor.artifactIdentity.digest = "not-a-sha256";
+		fs.writeFileSync(receiptPath, JSON.stringify(malformed), "utf-8");
+		assert.throws(() => readWorkflowReceipt(root, "workflow-artifact-invalid"), /artifactIdentity\.digest is invalid/);
+
+		malformed.entries.advisor.artifactIdentity.digest = createHash("sha256").update("review artifact\n", "utf-8").digest("hex");
+		malformed.entries.advisor.artifactIdentity.path = path.join(root, "other.md");
+		fs.writeFileSync(receiptPath, JSON.stringify(malformed), "utf-8");
+		assert.throws(() => readWorkflowReceipt(root, "workflow-artifact-invalid"), /artifactIdentity is stale/);
 	});
 
 	it("builds one metadata-only entry per workflow child", () => {
