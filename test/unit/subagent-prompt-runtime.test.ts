@@ -588,6 +588,9 @@ describe("subagent prompt runtime", () => {
 			handlers.get("session_compact")?.({ reason: "manual" });
 			assert.equal(sent.length, 2);
 			assert.equal(sent[1]?.deliverAs, "followUp");
+			assert.ok((sent[1]?.content.length ?? Infinity) <= (sent[0]?.content.length ?? 0) * 0.75, "compaction retry should cut the steering packet by at least 25%");
+			assert.match(sent[1]?.content ?? "", /Compaction checkpoint from the parent orchestrator/);
+			assert.match(sent[1]?.content ?? "", /Keep this guidance\./);
 			handlers.get("input")?.({ source: "extension", text: sent[1]?.content });
 			assert.equal(consumeSteerAcks(dir)[0]?.state, "queued");
 			handlers.get("turn_start")?.({});
