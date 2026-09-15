@@ -403,7 +403,8 @@ function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCom
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
-	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined || (detail.handoffContinuation !== undefined || detail.continuationEvent !== undefined));
+	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined || detail.continuation?.runIds.length
+		|| detail.handoffContinuation !== undefined || detail.continuationEvent !== undefined);
 	try {
 		pi.sendMessage(
 			{
@@ -606,7 +607,7 @@ export default function registerSubagentNotify(
 			emit([item]);
 			return completion;
 		}
-		if (details.handoffContinuation ?? details.continuationEvent) {
+		if (details.continuation?.runIds.length || (details.handoffContinuation ?? details.continuationEvent)) {
 			batcher.pushContinuation(item);
 			return completion;
 		}
