@@ -22,6 +22,19 @@ describe("buildCompletionKey", () => {
 		const second = buildCompletionKey({ agent: "reviewer", timestamp: 123, taskIndex: 1, totalTasks: 2, success: true }, "x");
 		assert.equal(first, second);
 	});
+
+	it("keeps handoff continuation events distinct from their source completion", () => {
+		const source = buildCompletionKey({ id: "run-123", sessionId: "session-a", state: "complete" }, "notify");
+		const continuation = buildCompletionKey({
+			id: "run-123",
+			sessionId: "session-a",
+			state: "complete",
+			handoffContinuation: { eventId: "handoff-1", sourceRunId: "run-123", runId: "run-456" },
+		}, "notify");
+		assert.notEqual(source, continuation);
+		assert.match(continuation, /handoff-1/);
+	});
+
 });
 
 describe("markSeenWithTtl", () => {

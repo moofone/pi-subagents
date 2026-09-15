@@ -848,6 +848,9 @@ export interface SubagentResultIntercomPayload {
 	artifactPath?: string;
 	sessionPath?: string;
 	parallelHandoff?: ParallelHandoffReference;
+	/** Lineage retained when this run continues a previous handoff. */
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
 }
 
 // ============================================================================
@@ -1272,6 +1275,23 @@ export interface WaitCompletionChild {
 	model?: string;
 	contextOverflow?: boolean;
 	artifactPaths?: Partial<ArtifactPaths>;
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
+}
+
+/** Stable lineage carried by a resumed child and its terminal completion. */
+export interface ContinuationLineage {
+	runIds: string[];
+}
+
+/** Durable event identity for a handoff that continues an earlier run. */
+export interface HandoffContinuationEvent {
+	eventId?: string;
+	sourceRunId?: string;
+	runId?: string;
+	sequence?: number;
+	kind?: "handoff" | "resume" | "continuation";
 }
 
 /**
@@ -1286,6 +1306,9 @@ export interface WaitCompletion {
 	success?: boolean;
 	/** Versioned bounded output archive retained with the durable completion replay. */
 	archivePath?: string;
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
 	results?: WaitCompletionChild[];
 	workflowChildren?: WorkflowChildSummaryV1;
 }
@@ -1842,6 +1865,9 @@ export interface AsyncStatus {
 		processTerminal?: ProcessTerminalV1;
 		capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 		capabilityAudit?: SubagentCapabilityAudit;
+		continuation?: ContinuationLineage;
+		handoffContinuation?: HandoffContinuationEvent;
+		continuationEvent?: HandoffContinuationEvent;
 	}>;
 	sessionDir?: string;
 	outputFile?: string;
@@ -1850,6 +1876,10 @@ export interface AsyncStatus {
 	sessionFile?: string;
 	outputs?: ChainOutputMap;
 	parallelHandoff?: ParallelHandoffReference;
+	/** Lineage retained when this run continues a previous handoff. */
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
 }
 
 export type AsyncJobStep = NonNullable<AsyncStatus["steps"]>[number] & {

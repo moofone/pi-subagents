@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
+import { DIRS, type AcceptanceInput, type AsyncStatus, type ContinuationLineage, type HandoffContinuationEvent, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import { normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
@@ -50,6 +50,9 @@ export type AsyncResumeTarget = {
 	thinking?: string;
 	thinkingCeiling?: ThinkingLevel;
 	recoveryDescriptor?: SteeringRecoveryDescriptor;
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	launchContractDigest?: string;
 	runner?: NonNullable<AsyncStatus["steps"]>[number]["runner"];
@@ -70,8 +73,11 @@ interface AsyncResultFile {
 	model?: string;
 	thinking?: string;
 	launchContractDigest?: string;
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
-	results?: Array<{ agent?: string; sessionName?: string; success?: boolean; sessionFile?: string; intercomTarget?: string; model?: string; thinking?: string; launchContractDigest?: string; capabilityCeiling?: ResolvedSubagentCapabilityCeiling }>;
+	results?: Array<{ agent?: string; sessionName?: string; success?: boolean; sessionFile?: string; intercomTarget?: string; model?: string; thinking?: string; launchContractDigest?: string; continuation?: ContinuationLineage; handoffContinuation?: HandoffContinuationEvent; continuationEvent?: HandoffContinuationEvent; capabilityCeiling?: ResolvedSubagentCapabilityCeiling }>;
 }
 
 export interface AsyncRunLocation {
@@ -82,6 +88,31 @@ export interface AsyncRunLocation {
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function parseContinuation(value: unknown, source: string): ContinuationLineage | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid async continuation '${source}': expected an object.`);
+	const runIds = (value as Record<string, unknown>).runIds;
+	if (!Array.isArray(runIds) || runIds.some((runId) => typeof runId !== "string" || !runId.trim())) throw new Error(`Invalid async continuation '${source}': runIds must contain non-empty strings.`);
+	const normalized = [...new Set(runIds.map((runId) => (runId as string).trim()))];
+	if (!normalized.length) throw new Error(`Invalid async continuation '${source}': runIds must not be empty.`);
+	return { runIds: normalized };
+}
+
+function parseHandoffContinuation(value: unknown, source: string): HandoffContinuationEvent | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid handoff continuation '${source}': expected an object.`);
+	const record = value as Record<string, unknown>;
+	const eventId = typeof record.eventId === "string" && record.eventId.trim() ? record.eventId.trim() : typeof record.id === "string" && record.id.trim() ? record.id.trim() : undefined;
+	const sourceRunId = typeof record.sourceRunId === "string" && record.sourceRunId.trim() ? record.sourceRunId.trim() : undefined;
+	const runId = typeof record.runId === "string" && record.runId.trim() ? record.runId.trim() : undefined;
+	const kind = record.kind === "handoff" || record.kind === "resume" || record.kind === "continuation" ? record.kind : undefined;
+	if (record.kind !== undefined && !kind) throw new Error(`Invalid handoff continuation '${source}': kind is invalid.`);
+	const sequence = record.sequence;
+	if (sequence !== undefined && (!Number.isSafeInteger(sequence) || (sequence as number) < 0)) throw new Error(`Invalid handoff continuation '${source}': sequence must be a non-negative integer.`);
+	if (!eventId && !sourceRunId && !runId && !kind && sequence === undefined) throw new Error(`Invalid handoff continuation '${source}': event identity is missing.`);
+	return { ...(eventId ? { eventId } : {}), ...(sourceRunId ? { sourceRunId } : {}), ...(runId ? { runId } : {}), ...(kind ? { kind } : {}), ...(sequence !== undefined ? { sequence: sequence as number } : {}) };
 }
 
 function ensureObject(value: unknown, source: string): Record<string, unknown> {
@@ -113,14 +144,18 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 			const model = validateOptionalString(child, "model", resultPath, `results[${index}].model`);
 			const thinking = validateOptionalString(child, "thinking", resultPath, `results[${index}].thinking`);
 			const launchContractDigest = validateOptionalString(child, "launchContractDigest", resultPath, `results[${index}].launchContractDigest`);
+			const continuation = parseContinuation(child.continuation, `${resultPath} results[${index}].continuation`);
+			const handoffContinuation = parseHandoffContinuation(child.handoffContinuation ?? child.continuationEvent, `${resultPath} results[${index}].handoffContinuation`);
 			const capabilityCeiling = child.capabilityCeiling === undefined ? undefined : parseSubagentCapabilityCeiling(child.capabilityCeiling, `async result file '${resultPath}' results[${index}].capabilityCeiling`);
 			const success = child.success;
 			if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': results[${index}].success must be a boolean.`);
-			return { agent, sessionName, sessionFile, intercomTarget, model, thinking, launchContractDigest, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(typeof success === "boolean" ? { success } : {}) };
+			return { agent, sessionName, sessionFile, intercomTarget, model, thinking, launchContractDigest, ...(continuation ? { continuation } : {}), ...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}), ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(typeof success === "boolean" ? { success } : {}) };
 		});
 	}
 	const success = data.success;
 	if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': success must be a boolean.`);
+	const continuation = parseContinuation(data.continuation, `${resultPath}.continuation`);
+	const handoffContinuation = parseHandoffContinuation(data.handoffContinuation ?? data.continuationEvent, `${resultPath}.handoffContinuation`);
 	return {
 		id: validateOptionalString(data, "id", resultPath),
 		runId: validateOptionalString(data, "runId", resultPath),
@@ -133,6 +168,8 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		model: validateOptionalString(data, "model", resultPath),
 		thinking: validateOptionalString(data, "thinking", resultPath),
 		launchContractDigest: validateOptionalString(data, "launchContractDigest", resultPath),
+		...(continuation ? { continuation } : {}),
+		...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 		...(data.capabilityCeiling === undefined ? {} : { capabilityCeiling: parseSubagentCapabilityCeiling(data.capabilityCeiling, `async result file '${resultPath}' capabilityCeiling`) }),
 		...(typeof success === "boolean" ? { success } : {}),
 		...(results ? { results } : {}),
@@ -266,6 +303,12 @@ function validateStatusForResume(status: AsyncStatus | null, source: string): vo
 	if (status.sessionId !== undefined && typeof status.sessionId !== "string") throw new Error(`Invalid async status '${source}': sessionId must be a string.`);
 	if (status.cwd !== undefined && typeof status.cwd !== "string") throw new Error(`Invalid async status '${source}': cwd must be a string.`);
 	if (status.sessionFile !== undefined && typeof status.sessionFile !== "string") throw new Error(`Invalid async status '${source}': sessionFile must be a string.`);
+	if (status.continuation !== undefined) status.continuation = parseContinuation(status.continuation, `async status '${source}'.continuation`);
+	if (status.handoffContinuation !== undefined || status.continuationEvent !== undefined) {
+		const event = parseHandoffContinuation(status.handoffContinuation ?? status.continuationEvent, `async status '${source}'.handoffContinuation`);
+		status.handoffContinuation = event;
+		status.continuationEvent = event;
+	}
 	if (status.capabilityCeiling !== undefined) status.capabilityCeiling = parseSubagentCapabilityCeiling(status.capabilityCeiling, `async status '${source}' capabilityCeiling`);
 	if (status.steps !== undefined) {
 		if (!Array.isArray(status.steps)) throw new Error(`Invalid async status '${source}': steps must be an array.`);
@@ -275,6 +318,12 @@ function validateStatusForResume(status: AsyncStatus | null, source: string): vo
 			if (typeof stepRecord.agent !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].agent must be a string.`);
 			if (stepRecord.sessionFile !== undefined && typeof stepRecord.sessionFile !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionFile must be a string.`);
 			if (stepRecord.sessionName !== undefined && typeof stepRecord.sessionName !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionName must be a string.`);
+			if (stepRecord.continuation !== undefined) stepRecord.continuation = parseContinuation(stepRecord.continuation, `async status '${source}' steps[${index}].continuation`);
+			if (stepRecord.handoffContinuation !== undefined || stepRecord.continuationEvent !== undefined) {
+				const event = parseHandoffContinuation(stepRecord.handoffContinuation ?? stepRecord.continuationEvent, `async status '${source}' steps[${index}].handoffContinuation`);
+				stepRecord.handoffContinuation = event;
+				stepRecord.continuationEvent = event;
+			}
 			if (stepRecord.model !== undefined && typeof stepRecord.model !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].model must be a string.`);
 			if (stepRecord.thinking !== undefined && typeof stepRecord.thinking !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].thinking must be a string.`);
 			if (stepRecord.thinkingCeiling !== undefined) stepRecord.thinkingCeiling = parseThinkingLevel(stepRecord.thinkingCeiling, `async status '${source}' steps[${index}].thinkingCeiling`);
@@ -479,6 +528,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 			const selectedStep = statusSteps[requestedIndex];
 			if (selectedStep?.status === "running") {
 				const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selectedStep.capabilityCeiling);
+				const continuation = selectedStep.continuation ?? result?.results?.[requestedIndex]?.continuation ?? result?.continuation ?? status?.continuation;
+				const handoffContinuation = selectedStep.handoffContinuation ?? selectedStep.continuationEvent ?? result?.results?.[requestedIndex]?.handoffContinuation ?? result?.results?.[requestedIndex]?.continuationEvent ?? result?.handoffContinuation ?? result?.continuationEvent ?? status?.handoffContinuation ?? status?.continuationEvent;
 				return {
 					kind: "live",
 					runId,
@@ -497,6 +548,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 					...(selectedStep.externalJob ? { externalJob: selectedStep.externalJob } : {}),
 					...(capabilityCeiling ? { capabilityCeiling } : {}),
 					...(selectedStep.thinkingCeiling ? { thinkingCeiling: selectedStep.thinkingCeiling } : {}),
+					...(continuation ? { continuation } : {}),
+					...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 					...(recoveryDescriptor ? { recoveryDescriptor } : {}),
 				};
 			}
@@ -511,6 +564,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 				throw new Error(`Async run '${runId}' has ${running.length} running children. Provide index to choose one.`);
 			}
 			const capabilityCeiling = intersectSubagentCapabilityCeilings(status?.capabilityCeiling, selected.step.capabilityCeiling);
+			const continuation = selected.step.continuation ?? result?.results?.[selected.index]?.continuation ?? result?.continuation ?? status?.continuation;
+			const handoffContinuation = selected.step.handoffContinuation ?? selected.step.continuationEvent ?? result?.results?.[selected.index]?.handoffContinuation ?? result?.results?.[selected.index]?.continuationEvent ?? result?.handoffContinuation ?? result?.continuationEvent ?? status?.handoffContinuation ?? status?.continuationEvent;
 			return {
 				kind: "live",
 				runId,
@@ -529,6 +584,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 				...(selected.step.externalJob ? { externalJob: selected.step.externalJob } : {}),
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				...(selected.step.thinkingCeiling ? { thinkingCeiling: selected.step.thinkingCeiling } : {}),
+				...(continuation ? { continuation } : {}),
+				...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 				...(recoveryDescriptor ? { recoveryDescriptor } : {}),
 			};
 		}
@@ -556,6 +613,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index)
 		: undefined;
 	const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? status?.cwd ?? result?.cwd ?? recoveryDescriptor?.cwd);
+	const continuation = statusSteps[index]?.continuation ?? resultSteps[index]?.continuation ?? result?.continuation ?? status?.continuation;
+	const handoffContinuation = statusSteps[index]?.handoffContinuation ?? statusSteps[index]?.continuationEvent ?? resultSteps[index]?.handoffContinuation ?? resultSteps[index]?.continuationEvent ?? result?.handoffContinuation ?? result?.continuationEvent ?? status?.handoffContinuation ?? status?.continuationEvent;
 
 	return {
 		kind: "revive",
@@ -575,6 +634,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		...(statusSteps[index]?.externalJob ? { externalJob: statusSteps[index]!.externalJob } : {}),
 		...(capabilityCeiling ? { capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
+		...(continuation ? { continuation } : {}),
+		...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 		...(recoveryDescriptor ? { recoveryDescriptor } : {}),
 	};
 }
@@ -616,6 +677,8 @@ export function buildRevivedAsyncTask(target: AsyncResumeTarget, message: string
 		`Original run: ${target.runId}`,
 		`Original agent: ${target.agent}`,
 		target.sessionFile ? `Original session file: ${target.sessionFile}` : undefined,
+		target.continuation?.runIds.length ? `Continuation lineage: ${target.continuation.runIds.join(" -> ")}` : undefined,
+		target.handoffContinuation?.eventId ? `Handoff continuation event: ${target.handoffContinuation.eventId}` : undefined,
 		"",
 		"Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child process is still alive.",
 		"",

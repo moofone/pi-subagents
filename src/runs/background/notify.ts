@@ -14,7 +14,7 @@ import {
 	createCompletionBatcher,
 	resolveCompletionBatchConfig,
 } from "./completion-batcher.ts";
-import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type ParallelHandoffReference, type ScheduleOrigin, type SubagentState } from "../../shared/types.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type ContinuationLineage, type HandoffContinuationEvent, type ParallelHandoffReference, type ScheduleOrigin, type SubagentState } from "../../shared/types.ts";
 import { safeTerminalText } from "../../shared/display-text.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { isUnexplainedProcessSignal } from "../shared/process-signal.ts";
@@ -42,6 +42,9 @@ export interface SubagentNotifyDetails {
 	childRuns?: Array<{ runId: string; workflowKey?: string; agent?: string; status?: string }>;
 	childOutputs?: SubagentNotifyChildOutput[];
 	reconciledFromDetachedChild?: string;
+	continuation?: ContinuationLineage;
+	handoffContinuation?: HandoffContinuationEvent;
+	continuationEvent?: HandoffContinuationEvent;
 	sessionLabel?: string;
 	sessionValue?: string;
 	handoffPath?: string;
@@ -85,6 +88,9 @@ export interface CompletionNotification {
 		timedOut?: boolean;
 		stopped?: boolean;
 		turnBudgetExceeded?: boolean;
+		continuation?: ContinuationLineage;
+		handoffContinuation?: HandoffContinuationEvent;
+		continuationEvent?: HandoffContinuationEvent;
 	}>;
 	timestamp?: number;
 	durationMs?: number;
@@ -101,6 +107,9 @@ export interface CompletionNotification {
 	/** True when an acknowledged grouped intercom relay already delivered this run. */
 	intercomDelivered?: boolean;
 	parallelHandoff?: ParallelHandoffReference;
+	continuation?: ContinuationLineage;
+	continuationEvent?: HandoffContinuationEvent;
+	handoffContinuation?: HandoffContinuationEvent;
 	scheduleOrigin?: ScheduleOrigin;
 }
 
@@ -241,11 +250,22 @@ function formatChildRun(child: { runId: string; workflowKey?: string; agent?: st
 	return `${label ? `${label}=` : ""}${child.runId}${status}`;
 }
 
+function formatHandoffContinuation(event: HandoffContinuationEvent): string {
+	const identity = event.eventId ?? "unidentified";
+	const source = event.sourceRunId ? `source ${event.sourceRunId}` : undefined;
+	const continued = event.runId ? `continued ${event.runId}` : undefined;
+	const sequence = event.sequence !== undefined ? `sequence ${event.sequence}` : undefined;
+	const metadata = [source, continued, sequence].filter((value): value is string => value !== undefined).join(", ");
+	return `Handoff continuation: ${identity}${metadata ? ` (${metadata})` : ""}`;
+}
+
 function formatCorrelationLines(details: SubagentNotifyDetails): string[] {
 	return [
 		details.workflowRunId ? `Workflow run: ${details.workflowRunId}` : undefined,
 		details.childRuns?.length ? `Child runs: ${details.childRuns.map(formatChildRun).join(", ")}` : undefined,
 		details.reconciledFromDetachedChild ? `Reconciled detached child: ${details.reconciledFromDetachedChild}` : undefined,
+		details.continuation?.runIds.length ? `Continuation lineage: ${details.continuation.runIds.join(" -> ")}` : undefined,
+		(details.handoffContinuation ?? details.continuationEvent) ? formatHandoffContinuation(details.handoffContinuation ?? details.continuationEvent!) : undefined,
 	].filter((line): line is string => line !== undefined);
 }
 
@@ -300,7 +320,9 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 	const workflowRunIndex = body.findIndex((line) => line.startsWith("Workflow run: "));
 	const childRunsIndex = body.findIndex((line) => line.startsWith("Child runs: "));
 	const reconciledIndex = body.findIndex((line) => line.startsWith("Reconciled detached child: "));
-	const metadataIndexes = [sessionIndex, handoffIndex, workflowRunIndex, childRunsIndex, reconciledIndex].filter((index) => index >= 0);
+	const continuationIndex = body.findIndex((line) => line.startsWith("Continuation lineage: "));
+	const handoffContinuationIndex = body.findIndex((line) => line.startsWith("Handoff continuation: "));
+	const metadataIndexes = [sessionIndex, handoffIndex, workflowRunIndex, childRunsIndex, reconciledIndex, continuationIndex, handoffContinuationIndex].filter((index) => index >= 0);
 	const firstMetadataIndex = metadataIndexes.length ? Math.min(...metadataIndexes) : body.length;
 	const resultEnd = firstMetadataIndex > 0 && body[firstMetadataIndex - 1]?.trim() === "" ? firstMetadataIndex - 1 : firstMetadataIndex;
 	const resultPreview = body.slice(0, resultEnd).join("\n").trim() || "(no output)";
@@ -318,6 +340,15 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		}).filter((child) => child.runId)
 		: undefined;
 	const reconciledFromDetachedChild = reconciledIndex >= 0 ? body[reconciledIndex]!.slice("Reconciled detached child: ".length).trim() : undefined;
+	const continuation = continuationIndex >= 0 ? { runIds: body[continuationIndex]!.slice("Continuation lineage: ".length).split(" -> ").map((runId) => runId.trim()).filter(Boolean) } : undefined;
+	const handoffContinuation = handoffContinuationIndex >= 0
+		? (() => {
+			const value = body[handoffContinuationIndex]!.slice("Handoff continuation: ".length).trim();
+			const match = value.match(/^([^ ]+)(?: \(source ([^,)]*)?(?:, continued ([^,)]*))?(?:, sequence (\d+))?\))?$/);
+			if (!match) return { eventId: value };
+			return { eventId: match[1], ...(match[2] ? { sourceRunId: match[2].trim() } : {}), ...(match[3] ? { runId: match[3].trim() } : {}), ...(match[4] ? { sequence: Number(match[4]) } : {}) };
+		})()
+		: undefined;
 	let sessionLabel: string | undefined;
 	let sessionValue: string | undefined;
 	if (sessionLine) {
@@ -336,6 +367,8 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		...(workflowRunId ? { workflowRunId } : {}),
 		...(childRuns?.length ? { childRuns } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
+		...(continuation?.runIds.length ? { continuation } : {}),
+		...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 		...(sessionLabel && sessionValue ? { sessionLabel, sessionValue } : {}),
 	};
 }
@@ -370,7 +403,7 @@ function sendCompletion(pi: Pick<ExtensionAPI, "sendMessage">, items: PendingCom
 	if (items.length === 0) return true;
 	const details = items.map((item) => item.details);
 	const content = details.length === 1 ? formatSingleCompletion(details[0]!) : formatGroupedCompletion(details);
-	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined);
+	const display = details.some((detail) => detail.source === "foreground" || detail.status !== "completed" || detail.scheduleOrigin !== undefined || (detail.handoffContinuation !== undefined || detail.continuationEvent !== undefined));
 	try {
 		pi.sendMessage(
 			{
@@ -450,6 +483,13 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		})
 		: undefined;
 	const reconciledFromDetachedChild = typeof result.reconciledFromDetachedChild === "string" ? result.reconciledFromDetachedChild : undefined;
+	const continuation = result.continuation && typeof result.continuation === "object" && Array.isArray(result.continuation.runIds)
+		? { runIds: [...new Set(result.continuation.runIds.filter((runId): runId is string => typeof runId === "string" && Boolean(runId.trim())).map((runId) => runId.trim()))] }
+		: undefined;
+	const rawContinuationEvent = result.handoffContinuation ?? result.continuationEvent;
+	const handoffContinuation = rawContinuationEvent && typeof rawContinuationEvent === "object" && !Array.isArray(rawContinuationEvent)
+		? rawContinuationEvent as HandoffContinuationEvent
+		: undefined;
 	const session =
 		result.shareUrl
 			? { label: "Session", value: result.shareUrl }
@@ -475,6 +515,8 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		...(childRuns.length ? { childRuns } : {}),
 		...(childOutputs?.length ? { childOutputs } : {}),
 		...(reconciledFromDetachedChild ? { reconciledFromDetachedChild } : {}),
+		...(continuation?.runIds.length ? { continuation } : {}),
+		...(handoffContinuation ? { handoffContinuation, continuationEvent: handoffContinuation } : {}),
 		...(session ? { sessionLabel: session.label, sessionValue: session.value } : {}),
 	};
 }
@@ -562,6 +604,10 @@ export default function registerSubagentNotify(
 		if (details.status !== "completed") {
 			batcher.flush();
 			emit([item]);
+			return completion;
+		}
+		if (details.handoffContinuation ?? details.continuationEvent) {
+			batcher.pushContinuation(item);
 			return completion;
 		}
 		batcher.push(item);

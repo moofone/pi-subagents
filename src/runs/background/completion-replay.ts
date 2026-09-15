@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
-import type { WaitCompletion } from "../../shared/types.ts";
+import type { ContinuationLineage, HandoffContinuationEvent, WaitCompletion } from "../../shared/types.ts";
 import { utf8Tail } from "../../shared/utf8.ts";
 
 const REPLAY_VERSION = 1;
@@ -53,6 +53,27 @@ export function completionArchivePath(resultsDir: string, runId: string): string
 function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+
+function continuationLineage(value: unknown): ContinuationLineage | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const runIds = (value as Record<string, unknown>).runIds;
+	if (!Array.isArray(runIds)) return undefined;
+	const normalized = [...new Set(runIds.filter((runId): runId is string => typeof runId === "string" && Boolean(runId.trim())).map((runId) => runId.trim()))];
+	return normalized.length ? { runIds: normalized } : undefined;
+}
+
+function handoffContinuation(value: unknown): HandoffContinuationEvent | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const source = value as Record<string, unknown>;
+	const eventId = nonEmptyString(source.eventId) ?? nonEmptyString(source.id);
+	const sourceRunId = nonEmptyString(source.sourceRunId);
+	const runId = nonEmptyString(source.runId);
+	const kind = source.kind === "handoff" || source.kind === "resume" || source.kind === "continuation" ? source.kind : undefined;
+	const sequence = typeof source.sequence === "number" && Number.isFinite(source.sequence) && Number.isSafeInteger(source.sequence) && source.sequence >= 0 ? source.sequence : undefined;
+	if (!eventId && !sourceRunId && !runId && !kind && sequence === undefined) return undefined;
+	return { ...(eventId ? { eventId } : {}), ...(sourceRunId ? { sourceRunId } : {}), ...(runId ? { runId } : {}), ...(sequence !== undefined ? { sequence } : {}), ...(kind ? { kind } : {}) };
+}
+
 
 function existingFile(value: unknown): string | undefined {
 	const filePath = nonEmptyString(value);
@@ -193,7 +214,14 @@ export function writeCompletionReplay(input: {
 	ttlMs: number;
 }): CompletionReplayRecord {
 	const archivePath = writeCompletionArchive(input.resultsDir, input.runId, input.data, input.now);
-	const completion = { ...input.completion, archivePath };
+	const continuation = continuationLineage(input.data.continuation);
+	const continuationEvent = handoffContinuation(input.data.handoffContinuation ?? input.data.continuationEvent);
+	const completion = {
+		...input.completion,
+		...(continuation ? { continuation } : {}),
+		...(continuationEvent ? { handoffContinuation: continuationEvent, continuationEvent } : {}),
+		archivePath,
+	};
 	const record: CompletionReplayRecord = {
 		version: REPLAY_VERSION,
 		runId: input.runId,
