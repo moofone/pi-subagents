@@ -14,6 +14,7 @@ import {
 	normalizeWorkflowPreflight,
 	validateWorkflowPreflight,
 	workflowPreflightWarnings,
+	workflowDeadlineElapsed,
 } from "../../src/workflows/workflow-preflight.ts";
 
 const preflight = {
@@ -30,6 +31,15 @@ const preflight = {
 };
 
 describe("workflow preflight metadata", () => {
+	it("treats invalid and elapsed absolute deadlines as closed", () => {
+		assert.equal(workflowDeadlineElapsed(undefined, 100), false);
+		assert.equal(workflowDeadlineElapsed(101, 100), false);
+		assert.equal(workflowDeadlineElapsed(100, 100), true);
+		assert.equal(workflowDeadlineElapsed(99, 100), true);
+		assert.equal(workflowDeadlineElapsed(Number.NaN, 100), true);
+		assert.equal(workflowDeadlineElapsed(Number.POSITIVE_INFINITY, 100), true);
+	});
+
 	it("normalizes bounded display hints and renders the compact table", () => {
 		const normalized = normalizeWorkflowPreflight({
 			...preflight,

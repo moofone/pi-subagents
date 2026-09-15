@@ -79,6 +79,7 @@ import { resolvePermissionRules, type PermissionConfig } from "../shared/permiss
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
 import { executeWorkflowHostCommand, resolveWorkflowHostOutputClaimPath, type WorkflowHostCommandExecutionInput, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "../../workflows/host-command.ts";
+import { workflowDeadlineElapsed } from "../../workflows/workflow-preflight.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -287,8 +288,8 @@ interface AsyncExecutionResult {
 	isError?: boolean;
 }
 
-function asyncHostDeadlineElapsed(absoluteDeadlineAt: number | undefined): boolean {
-	return absoluteDeadlineAt !== undefined && (!Number.isFinite(absoluteDeadlineAt) || absoluteDeadlineAt <= Date.now());
+export function asyncDeadlineElapsed(absoluteDeadlineAt: number | undefined): boolean {
+	return workflowDeadlineElapsed(absoluteDeadlineAt);
 }
 
 /**
@@ -298,7 +299,7 @@ function asyncHostDeadlineElapsed(absoluteDeadlineAt: number | undefined): boole
  * a custom executor cannot accidentally launch an already-expired step.
  */
 export async function executeAsyncHostStep(input: WorkflowHostCommandExecutionInput): Promise<WorkflowHostCommandResult> {
-	if (asyncHostDeadlineElapsed(input.absoluteDeadlineAt)) {
+	if (asyncDeadlineElapsed(input.absoluteDeadlineAt)) {
 		throw new Error(`The absolute deadline expired before host command '${input.key}' could launch.`);
 	}
 	return executeWorkflowHostCommand(input);
@@ -323,7 +324,7 @@ export function createAsyncHostStepRunner(input: {
 		const outputPath = params.output ? path.resolve(input.workflowCwd, params.output) : defaultOutputPath;
 		// Do not leave a stale reservation behind when a retry reaches this
 		// callback after its enclosing single-run deadline has elapsed.
-		if (asyncHostDeadlineElapsed(input.absoluteDeadlineAt)) {
+		if (asyncDeadlineElapsed(input.absoluteDeadlineAt)) {
 			throw new Error(`The absolute deadline expired before host command '${key}' could launch.`);
 		}
 		const claimPath = resolveWorkflowHostOutputClaimPath(outputPath);

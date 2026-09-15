@@ -213,6 +213,20 @@ describe("scripted workflow runtime", () => {
 		assert.equal(result.value, "done");
 	});
 
+	it("checks the elapsed/token gate immediately before dispatch", async () => {
+		let launches = 0;
+		await assert.rejects(
+			runWorkflowScript({
+				script: `return await runs.run("child", { agent: "worker", task: "Do work" });`,
+				beforeLaunch() { return "Workflow gate closed: elapsed timeout or token budget exhausted."; },
+				async launch(key) { launches += 1; return { key, ok: true, output: "unexpected", artifactPaths: [] }; },
+				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+			}),
+			/Workflow gate closed: elapsed timeout or token budget exhausted/,
+		);
+		assert.equal(launches, 0);
+	});
+
 	it("exposes validated state only when a mission state adapter is present", async () => {
 		const values = new Map<string, unknown>();
 		const withState = await runWorkflowScript({
