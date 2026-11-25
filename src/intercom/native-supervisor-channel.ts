@@ -31,6 +31,10 @@ const CHANNEL_POLL_MS = Math.min(POLL_INTERVAL_MS, 500);
 const CHANNEL_SAFETY_POLL_MS = 5000;
 const STALE_EMPTY_CHANNEL_AGE_MS = 60 * 1000;
 const STALE_EMPTY_CHANNEL_CLEANUP_INTERVAL_MS = 60 * 1000;
+// A channel with no request left and only answered replies, untouched this long, is dead weight: every session's poll scans every channel
+// directory under the root, so leftovers (one per finished run) multiply into thousands of readdirs a second and block the event loop
+// of a host that runs many sessions. Well past the ask timeout (10 min), so no reply is still awaited.
+const STALE_ANSWERED_CHANNEL_AGE_MS = 60 * 60 * 1000;
 const MAX_SUPERVISOR_REQUEST_CORRELATIONS = 256;
 const SUPERVISOR_REQUEST_CORRELATION_RETENTION_MS = 10 * 60 * 1000;
 
@@ -410,7 +414,26 @@ function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number, pl
 	const requestEntries = readDirectoryEntries(requestsDir, platform);
 	if (!requestEntries || requestEntries.length > 0) return false;
 	const replyEntries = readDirectoryEntries(repliesDir, platform);
-	if (!replyEntries || replyEntries.length > 0) return false;
+	if (!replyEntries) return false;
+	if (replyEntries.length > 0) {
+		if (nowMs - newestKnownMtimeMs < STALE_ANSWERED_CHANNEL_AGE_MS) return false;
+		for (const entry of replyEntries) {
+			if (!entry.isFile()) return false;
+			const file = path.join(repliesDir, entry.name);
+			try {
+				if (nowMs - fs.statSync(file).mtimeMs < STALE_ANSWERED_CHANNEL_AGE_MS) return false;
+			} catch {
+				return false;
+			}
+		}
+		for (const entry of replyEntries) {
+			try {
+				fs.unlinkSync(path.join(repliesDir, entry.name));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+			}
+		}
+	}
 
 	if (!removeEmptyDirectory(requestsDir)) return false;
 	if (!removeEmptyDirectory(repliesDir)) return false;

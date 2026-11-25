@@ -710,6 +710,36 @@ describe("native supervisor channel", () => {
 		assert.equal(fs.existsSync(staleWithReply), true);
 	});
 
+	it("prunes channels left with only answered replies for over an hour, and keeps a recent reply", () => {
+		const currentSessionId = `session-${randomUUID()}`;
+		const answered = makeEmptyChannel(`run-${randomUUID()}`);
+		const answeredReply = path.join(answered, "replies", "reply.json");
+		fs.writeFileSync(answeredReply, "{}");
+		const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		fs.utimesSync(answeredReply, old, old);
+		ageChannel(answered, 2 * 60 * 60 * 1000);
+		const recentReply = makeEmptyChannel(`run-${randomUUID()}`);
+		fs.writeFileSync(path.join(recentReply, "replies", "reply.json"), "{}");
+		ageChannel(recentReply, 2 * 60 * 60 * 1000); // directories look old, the reply file itself is fresh
+		const withRequest = makeEmptyChannel(`run-${randomUUID()}`);
+		fs.writeFileSync(path.join(withRequest, "requests", "request.json"), "{}");
+		ageChannel(withRequest, 2 * 60 * 60 * 1000);
+		const ctx = {
+			cwd: process.cwd(),
+			hasUI: false,
+			sessionManager: { getSessionId: () => currentSessionId, getSessionFile: () => null, getEntries: () => [] },
+		};
+		const pi = { getAllTools: () => [], registerTool: () => {}, sendMessage: () => {}, getSessionName: () => "shared-name" };
+		const channel = createNativeSupervisorChannel(pi as never, makeState(currentSessionId, ctx));
+
+		channel.start();
+		channel.dispose();
+
+		assert.equal(fs.existsSync(answered), false);
+		assert.equal(fs.existsSync(recentReply), true);
+		assert.equal(fs.existsSync(withRequest), true);
+	});
+
 	it("emits foreground detach only after displaying a pending supervisor request", () => {
 		const currentSessionId = `session-${randomUUID()}`;
 		const runId = `run-${randomUUID()}`;
