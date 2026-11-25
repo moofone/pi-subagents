@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `PI_SUBAGENT_STRICT_THINKING=1` makes a native child fail when its model does not support the thinking level it asked for. Before, Pi ran the child at the nearest supported level without saying so, so `provider/model:high` could run at `medium`. Unset by default, which keeps that adjustment. See [configuration](docs/configuration.md#pi_subagent_strict_thinking). Backport of nicobailon/pi-subagents#3351.
+
 ## [0.85.0] - 2026-11-04
 
 ### Highlights
